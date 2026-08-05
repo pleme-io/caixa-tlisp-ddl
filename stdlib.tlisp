@@ -1,0 +1,510 @@
+;; caixa-tlisp-ddl — an additive-only DDL classifier and sunset-lifecycle
+;; helper for shinka model delivery. Pure library: no top-level argv parsing
+;; and no `exit` calls, so a CLI consumer can inline this file ahead of its
+;; own entry point (tatara-script `require` does not import at top level;
+;; composition is by inlining, per the family's convention — see README).
+;;
+;; The contract this enforces, from theory/SHINKA-MODEL-EVOLUTION.md §IV.5:
+;; a model grows and is never cut. Columns are tagged and sunset, drained and
+;; sealed — they are not dropped. The classifier is FAIL-CLOSED: anything it
+;; cannot positively recognise as additive is refused, so a novel statement
+;; shape is a refusal rather than a silent permit.
+
+;; ────────────────────────────────────────────────────────────────
+;; exec-capture result accessors (same shape as _tlisp-stdlib /
+;; caixa-tlisp-handoff — reused convention, not reinvented)
+;; ────────────────────────────────────────────────────────────────
+
+(define (status-of result) (alist-get result "status" -1))
+
+(define (stdout-of result) (alist-get result "stdout" ""))
+
+(define (stderr-of result) (alist-get result "stderr" ""))
+
+;; ────────────────────────────────────────────────────────────────
+;; String helpers
+;;
+;; `string-join` mis-detects some list shapes and throws a false
+;; TypeMismatch (see caixa-tlisp-rollout's README); `ddl:join` uses only
+;; `string-append` and sidesteps it. There is no `substring` builtin, so
+;; every scanner below is split/join based rather than character-wise.
+;; ────────────────────────────────────────────────────────────────
+
+(define (ddl:join sep lst)
+  (if (null? lst)
+      ""
+      (reduce (fn (acc s) (string-append acc (string-append sep s)))
+              (car lst)
+              (cdr lst))))
+
+(define (ddl:contains? s needle)
+  (> (length (string-split s needle)) 1))
+
+(define (ddl:count-char s ch)
+  (- (length (string-split s ch)) 1))
+
+(define (ddl:blank? s)
+  (eq? (string-trim s) ""))
+
+;; ────────────────────────────────────────────────────────────────
+;; Stage 1 — strip `--` line comments, quote-aware.
+;;
+;; A naive split-at-`--` is unsafe in the one direction that matters: it
+;; would silently delete the tail of `SELECT '--' ; DROP TABLE t`, hiding a
+;; destructive statement from the classifier. So a `--` only starts a
+;; comment when the text before it holds an EVEN number of single quotes.
+;; ────────────────────────────────────────────────────────────────
+
+(define (ddl:strip-comment-rest acc pieces)
+  (if (null? pieces)
+      acc
+      (if (eq? 0 (mod (ddl:count-char acc "'") 2))
+          acc
+          (ddl:strip-comment-rest
+            (string-append acc (string-append "--" (car pieces)))
+            (cdr pieces)))))
+
+(define (ddl:strip-line-comment line)
+  (let ((pieces (string-split line "--")))
+    (if (eq? 1 (length pieces))
+        line
+        (ddl:strip-comment-rest (car pieces) (cdr pieces)))))
+
+(define (ddl:strip-line-comments doc)
+  (ddl:join " " (map ddl:strip-line-comment (string-split doc "\n"))))
+
+;; ────────────────────────────────────────────────────────────────
+;; Stage 2 — strip `/* */` block comments (may span lines, so this runs
+;; after the lines are joined).
+;; ────────────────────────────────────────────────────────────────
+
+(define (ddl:strip-block-comments doc)
+  (re-replace "(?s)/\\*.*?\\*/" doc " "))
+
+;; ────────────────────────────────────────────────────────────────
+;; Stage 3 — blank the CONTENTS of single-quoted literals, keeping the
+;; quotes themselves. This is what makes splitting on `;` safe: a
+;; semicolon inside a literal is gone before the split sees it. SQL's
+;; doubled-quote escape ('') toggles twice and lands back outside, which
+;; is the correct result.
+;;
+;; Double-quoted identifiers are deliberately NOT blanked — they carry the
+;; table and column names the classifier needs to read.
+;; ────────────────────────────────────────────────────────────────
+
+(define (ddl:blank-walk pieces inside acc)
+  (if (null? pieces)
+      acc
+      (ddl:blank-walk
+        (cdr pieces)
+        (not inside)
+        (string-append acc
+                       (string-append "'" (if inside "" (car pieces)))))))
+
+(define (ddl:blank-literals doc)
+  (let ((pieces (string-split doc "'")))
+    (if (eq? 1 (length pieces))
+        doc
+        (ddl:blank-walk (cdr pieces) #t (car pieces)))))
+
+;; ────────────────────────────────────────────────────────────────
+;; Stage 4 — normalise and split into statements.
+;; ────────────────────────────────────────────────────────────────
+
+(define (ddl:normalize stmt)
+  (string-trim (re-replace "\\s+" (string-lowercase stmt) " ")))
+
+(define (ddl:sanitize doc)
+  (ddl:blank-literals (ddl:strip-block-comments (ddl:strip-line-comments doc))))
+
+(define (ddl:split-statements doc)
+  (filter (fn (s) (not (ddl:blank? s)))
+          (map ddl:normalize (string-split (ddl:sanitize doc) ";"))))
+
+;; Dollar-quoted bodies ($$ … $$, $tag$ … $tag$) can carry arbitrary
+;; statements and their semicolons survive stage 3. Rather than
+;; mis-split them, the whole document is refused as unclassifiable.
+(define (ddl:dollar-quoted? doc)
+  (re-match? "\\$[a-zA-Z_]*\\$" doc))
+
+;; ────────────────────────────────────────────────────────────────
+;; The rule table — first match wins, so ORDER IS LOAD-BEARING.
+;; Destructive shapes are tested before the additive shapes that would
+;; otherwise swallow them (`alter table … drop column` must not be read
+;; as an ordinary `alter table`).
+;;
+;; Four verdicts, per §IV.5:
+;;   :additive           permit
+;;   :schema-destructive refuse, no waiver
+;;   :data-destructive   refuse unless declared sunset step 4 (drain)
+;;   :blocking           permit, with a warning
+;; Anything unmatched is :unknown and is refused.
+;; ────────────────────────────────────────────────────────────────
+
+;; `unless` is a plain substring, not a pattern: the regex engine here is
+;; Rust's `regex` crate, which has no lookaround, so "matches X but not Y"
+;; is expressed as a second field rather than a `(?!…)` group.
+(define (ddl:rule-unless pattern unless verdict name reason)
+  (list (list "pattern" pattern)
+        (list "unless" unless)
+        (list "verdict" verdict)
+        (list "rule" name)
+        (list "reason" reason)))
+
+(define (ddl:rule pattern verdict name reason)
+  (ddl:rule-unless pattern "" verdict name reason))
+
+(define ddl:rules
+  (list
+    ;; -- schema-destructive: refused outright ------------------------
+    (ddl:rule "^drop " :schema-destructive "drop-object"
+              "DROP removes a schema object; the model grows, it is not cut")
+    (ddl:rule "^truncate " :schema-destructive "truncate"
+              "TRUNCATE empties a table outside the sunset lifecycle")
+    (ddl:rule "^alter [a-z ]*table .* drop (column|constraint|index|key|primary key|foreign key|partition)"
+              :schema-destructive "alter-drop"
+              "a dropped column is unrecoverable; tag and sunset it instead")
+    (ddl:rule "^alter [a-z ]*table [^ ]+ rename" :schema-destructive "rename-table"
+              "a rename breaks every existing reader; add the new name additively")
+    (ddl:rule "^alter [a-z ]*table .* rename (column|constraint)"
+              :schema-destructive "rename-column"
+              "a rename breaks every existing reader; add the new name additively")
+    (ddl:rule "^alter (index|sequence|view|schema|type|materialized view) [^ ]+ rename"
+              :schema-destructive "rename-object"
+              "a rename breaks every existing reader")
+    (ddl:rule "alter( column)? [^ ]+ (set data )?type "
+              :schema-destructive "type-change"
+              "an in-place type change rewrites the table and can lose precision")
+    (ddl:rule "drop (default|not null|identity|expression)"
+              :schema-destructive "attribute-drop"
+              "removing a column attribute is a cut, not a growth")
+    (ddl:rule "^revoke " :schema-destructive "revoke"
+              "REVOKE withdraws access already granted; grant narrower instead")
+
+    ;; -- data-destructive: refused unless declared drain -------------
+    (ddl:rule "^delete " :data-destructive "delete"
+              "DELETE removes rows; only sunset step 4 (drain) may do this")
+    (ddl:rule "^update " :data-destructive "update"
+              "UPDATE overwrites rows in place; seed with INSERT … ON CONFLICT")
+    (ddl:rule "^merge " :data-destructive "merge"
+              "MERGE can delete and overwrite; express the additive half instead")
+
+    ;; -- blocking: permitted, with a warning -------------------------
+    (ddl:rule-unless "^create (unique )?index " "concurrently" :blocking "index-lock"
+              "CREATE INDEX without CONCURRENTLY holds a write lock for the build")
+    (ddl:rule "^reindex " :blocking "reindex-lock"
+              "REINDEX holds a lock for the duration of the rebuild")
+    ;; MySQL adds indexes through ALTER TABLE rather than CREATE INDEX. Same
+    ;; disposition as index-lock: additive to the schema, but it builds the
+    ;; index under a lock, so it is permitted with a warning rather than
+    ;; waved through as an ordinary ADD.
+    (ddl:rule "^alter [a-z ]*table .* add (unique |fulltext |spatial )?(index|key)"
+              :blocking "alter-add-index"
+              "ALTER TABLE ... ADD INDEX/KEY builds the index under a lock")
+    (ddl:rule "^alter [a-z ]*table .* add primary key" :blocking "alter-add-pk"
+              "ADD PRIMARY KEY rewrites the table under a lock")
+    (ddl:rule-unless "add constraint " "not valid" :blocking "constraint-scan"
+              "ADD CONSTRAINT without NOT VALID scans the whole table under lock")
+    (ddl:rule "set not null" :blocking "not-null-scan"
+              "SET NOT NULL scans the table and fails outright on existing NULLs")
+    (ddl:rule "^vacuum full" :blocking "vacuum-full"
+              "VACUUM FULL rewrites the table under an exclusive lock")
+    (ddl:rule "^cluster " :blocking "cluster-lock"
+              "CLUSTER rewrites the table under an exclusive lock")
+    (ddl:rule "^lock " :blocking "explicit-lock"
+              "an explicit LOCK blocks other writers for the transaction")
+    (ddl:rule "add column .* default [^ ]*\\(" :blocking "volatile-default"
+              "a DEFAULT calling a function may be volatile and rewrite the table")
+
+    ;; -- additive: permitted -----------------------------------------
+    (ddl:rule "^create (database|schema|table|sequence|type|domain|extension|view|materialized view|index|unique index|function|procedure|trigger|role|policy|publication|collation|aggregate|operator|server|cast|text search)"
+              :additive "create-object" "creates a new object")
+    (ddl:rule "^alter [a-z ]*table .* add (column|constraint)" :additive "alter-add"
+              "adds a column or constraint")
+    ;; SET DEFAULT only affects future inserts and rewrites nothing. Its
+    ;; destructive counterpart, DROP DEFAULT, is refused above.
+    (ddl:rule "^alter [a-z ]*table .* alter( column)? [^ ]+ set default"
+              :additive "set-default" "changes the default for future inserts")
+    (ddl:rule "owner to " :additive "owner-to"
+              "an ownership repair, the fix for runtime-created schemas")
+    (ddl:rule "^alter default privileges " :additive "default-privileges"
+              "widens future grants without touching existing objects")
+    (ddl:rule "^alter sequence [^ ]+ owned by" :additive "sequence-owned-by"
+              "binds a sequence to its column")
+    (ddl:rule "^grant " :additive "grant" "widens access")
+    (ddl:rule "^comment on " :additive "comment"
+              "metadata only; this is how a sunset is recorded")
+    (ddl:rule "^insert " :additive "insert" "adds rows")
+    (ddl:rule "^copy [^ ]+ .*from " :additive "copy-from" "loads rows in")
+    (ddl:rule "^select " :additive "select" "read-only query")
+    (ddl:rule "^(begin|commit|rollback|end|start transaction|savepoint|set |reset )"
+              :additive "session" "transaction or session control")
+    ;; MySQL shapes. `use` selects a database and `unlock tables` releases a
+    ;; lock -- both benign. `lock tables` is NOT here: it is caught above by
+    ;; the `^lock ` blocking rule, which is the correct verdict for it.
+    (ddl:rule "^use " :additive "use-database" "selects the target database")
+    (ddl:rule "^unlock tables" :additive "unlock" "releases a table lock")))
+
+(define (ddl:rule-get r key) (alist-get r key ""))
+
+(define (ddl:rule-hit? r stmt)
+  (let ((unless (ddl:rule-get r "unless")))
+    (and (re-match? (ddl:rule-get r "pattern") stmt)
+         (or (eq? unless "") (not (ddl:contains? stmt unless))))))
+
+(define (ddl:match-rule stmt rules)
+  (if (null? rules)
+      #f
+      (if (ddl:rule-hit? (car rules) stmt)
+          (car rules)
+          (ddl:match-rule stmt (cdr rules)))))
+
+(define (ddl:verdict stmt verdict rule reason)
+  (list (list "statement" stmt)
+        (list "verdict" verdict)
+        (list "rule" rule)
+        (list "reason" reason)))
+
+(define (ddl:classify stmt)
+  (let ((hit (ddl:match-rule stmt ddl:rules)))
+    (if hit
+        (ddl:verdict stmt
+                     (ddl:rule-get hit "verdict")
+                     (ddl:rule-get hit "rule")
+                     (ddl:rule-get hit "reason"))
+        (ddl:verdict stmt :unknown "unrecognised"
+                     "no rule recognises this statement; refused fail-closed"))))
+
+(define (ddl:verdict-of v) (alist-get v "verdict" :unknown))
+
+(define (ddl:statement-of v) (alist-get v "statement" ""))
+
+(define (ddl:reason-of v) (alist-get v "reason" ""))
+
+(define (ddl:rule-of v) (alist-get v "rule" ""))
+
+(define (ddl:classify-document doc)
+  (if (ddl:dollar-quoted? (ddl:sanitize doc))
+      (list (ddl:verdict "(whole document)" :unknown "dollar-quoted"
+                         "a dollar-quoted body can hide any statement; refused fail-closed"))
+      (map ddl:classify (ddl:split-statements doc))))
+
+;; ────────────────────────────────────────────────────────────────
+;; The sunset lifecycle — five steps, and there is deliberately no
+;; sixth. A sealed column stays in the table forever, empty. Step 4 is
+;; the ONLY step permitted to be data-destructive, and only when the
+;; caller declares it.
+;; ────────────────────────────────────────────────────────────────
+
+(define ddl:sunset-steps
+  (list "deprecate" "dual-write" "backfill" "drain" "seal"))
+
+(define (ddl:sunset-step? name)
+  (> (length (filter (fn (s) (eq? s name)) ddl:sunset-steps)) 0))
+
+(define (ddl:drain-step? name) (eq? name "drain"))
+
+(define (ddl:sunset-comment table column replacement on-date)
+  (string-format
+    "COMMENT ON COLUMN {}.{} IS 'sunset: replaced by {} on {}; do not read';"
+    table column replacement on-date))
+
+(define (ddl:seal-comment table column on-date)
+  (string-format
+    "COMMENT ON COLUMN {}.{} IS 'sealed: drained {}; no readers, no writers, retained empty';"
+    table column on-date))
+
+;; ────────────────────────────────────────────────────────────────
+;; The gate — the entry point a CI check or the shinka wire boundary
+;; calls. `sunset-step` is the caller's declaration; only "drain"
+;; unlocks the data-destructive verdicts, and nothing unlocks the
+;; schema-destructive or unknown ones.
+;; ────────────────────────────────────────────────────────────────
+
+(define (ddl:permitted? verdict sunset-step)
+  (cond ((eq? verdict :additive) #t)
+        ((eq? verdict :blocking) #t)
+        ((eq? verdict :data-destructive) (ddl:drain-step? sunset-step))
+        (#t #f)))
+
+(define (ddl:gate doc sunset-step)
+  (let ((results (ddl:classify-document doc)))
+    (let ((violations
+            (filter (fn (v) (not (ddl:permitted? (ddl:verdict-of v) sunset-step)))
+                    results))
+          (warnings
+            (filter (fn (v) (eq? (ddl:verdict-of v) :blocking)) results)))
+      (list (list "ok" (eq? 0 (length violations)))
+            (list "statements" results)
+            (list "violations" violations)
+            (list "warnings" warnings)
+            (list "sunset-step" sunset-step)))))
+
+(define (ddl:gate-ok? g) (alist-get g "ok" #f))
+
+(define (ddl:gate-violations g) (alist-get g "violations" (list)))
+
+(define (ddl:gate-warnings g) (alist-get g "warnings" (list)))
+
+(define (ddl:verdict-label v)
+  (cond ((eq? v :additive) "additive")
+        ((eq? v :blocking) "blocking")
+        ((eq? v :data-destructive) "data-destructive")
+        ((eq? v :schema-destructive) "schema-destructive")
+        (#t "unknown")))
+
+(define (ddl:render-verdict v)
+  (string-format "  {} [{}] {}"
+                 (ddl:verdict-label (ddl:verdict-of v))
+                 (ddl:rule-of v)
+                 (ddl:statement-of v)))
+
+(define (ddl:report g)
+  (let ((violations (ddl:gate-violations g))
+        (warnings (ddl:gate-warnings g)))
+    (ddl:join "\n"
+      (cons (if (ddl:gate-ok? g)
+                "ddl gate: pass"
+                (string-format "ddl gate: FAIL ({} refused)" (length violations)))
+            (append
+              (map (fn (v) (string-append (ddl:render-verdict v)
+                                          (string-append "\n      why: " (ddl:reason-of v))))
+                   violations)
+              (map ddl:render-verdict warnings))))))
+
+;; ────────────────────────────────────────────────────────────────
+;; Tests
+;; ────────────────────────────────────────────────────────────────
+
+;; Assertions use the BUILT-IN `assert` macro, which throws. `error` is a
+;; CONSTRUCTOR (Arity::Range(2,3)) that merely RETURNS a Value::Error, and
+;; deftest fails only on a thrown error -- so a hand-rolled
+;; `(if c #t (error "tag" msg))` assert is inert, and every test built on
+;; one is a false green. Proven by mutation here: breaking the quote-aware
+;; comment stripper still left a hand-rolled suite reporting 9/9.
+(define (ddl:one-verdict sql)
+  (ddl:verdict-of (car (ddl:classify-document sql))))
+
+(deftest "additive shapes are permitted"
+  (begin
+    (assert (eq? :additive (ddl:one-verdict "CREATE TABLE IF NOT EXISTS t (id int);"))
+                "create table")
+    (assert (eq? :additive (ddl:one-verdict "ALTER TABLE t ADD COLUMN c text;"))
+                "add column")
+    (assert (eq? :additive (ddl:one-verdict "GRANT USAGE ON SCHEMA s TO pangea;"))
+                "grant")
+    (assert (eq? :additive (ddl:one-verdict "ALTER SCHEMA s OWNER TO pangea;"))
+                "owner to")
+    (assert (eq? :additive (ddl:one-verdict "INSERT INTO t VALUES (1);"))
+                "insert")))
+
+(deftest "schema-destructive shapes are refused with no waiver"
+  (begin
+    (assert (eq? :schema-destructive (ddl:one-verdict "DROP TABLE t;")) "drop")
+    (assert (eq? :schema-destructive (ddl:one-verdict "ALTER TABLE t DROP COLUMN c;"))
+                "drop column")
+    (assert (eq? :schema-destructive (ddl:one-verdict "ALTER TABLE t RENAME TO u;"))
+                "rename")
+    (assert (not (ddl:gate-ok? (ddl:gate "DROP TABLE t;" "drain")))
+                "drain does not unlock a schema cut")))
+
+(deftest "data-destructive shapes need the declared drain step"
+  (begin
+    (assert (eq? :data-destructive (ddl:one-verdict "DELETE FROM t WHERE id = 1;"))
+                "delete")
+    (assert (not (ddl:gate-ok? (ddl:gate "UPDATE t SET c = NULL;" "")))
+                "undeclared update refused")
+    (assert (ddl:gate-ok? (ddl:gate "UPDATE t SET c = NULL;" "drain"))
+                "declared drain permitted")
+    (assert (not (ddl:gate-ok? (ddl:gate "UPDATE t SET c = NULL;" "backfill")))
+                "a non-drain step does not unlock it")))
+
+(deftest "blocking shapes pass but are reported"
+  (let ((g (ddl:gate "CREATE INDEX idx ON t (c);" "")))
+    (begin
+      (assert (ddl:gate-ok? g) "blocking is permitted")
+      (assert (eq? 1 (length (ddl:gate-warnings g))) "blocking is warned")
+      (assert (ddl:gate-ok? (ddl:gate "CREATE INDEX CONCURRENTLY idx ON t (c);" ""))
+                  "concurrently is clean"))))
+
+(deftest "unrecognised statements are refused fail-closed"
+  (begin
+    (assert (eq? :unknown (ddl:one-verdict "DO $$ BEGIN PERFORM 1; END $$;"))
+                "do block")
+    (assert (eq? :unknown (ddl:one-verdict "CALL some_procedure();")) "call")
+    (assert (not (ddl:gate-ok? (ddl:gate "WIBBLE FROBNICATE t;" "drain")))
+                "novel verb refused")))
+
+(deftest "a comment cannot smuggle a drop past the classifier"
+  (begin
+    (assert (eq? 1 (length (ddl:classify-document
+                                 "CREATE TABLE t (id int); -- DROP TABLE t;")))
+                "commented drop is stripped, not classified")
+    (assert (ddl:gate-ok? (ddl:gate "CREATE TABLE t (id int); -- DROP TABLE t;" ""))
+                "commented drop does not fail the gate")
+    (assert (eq? 1 (length (ddl:classify-document
+                                 "/* DROP TABLE t; */ CREATE TABLE t (id int);")))
+                "block-commented drop is stripped")))
+
+(deftest "a string literal cannot hide a drop from the classifier"
+  (let ((g (ddl:gate "INSERT INTO t VALUES ('--'); DROP TABLE t;" "")))
+    (begin
+      (assert (not (ddl:gate-ok? g))
+                  "the drop after a literal containing -- is still seen")
+      (assert (eq? 1 (length (ddl:gate-violations g)))
+                  "exactly the drop is refused"))))
+
+(deftest "a semicolon inside a literal does not split a statement"
+  (assert (eq? 1 (length (ddl:classify-document
+                               "INSERT INTO t VALUES ('a;b');")))
+              "one statement, not two"))
+
+(deftest "mysqldump dialect shapes classify, they do not fall through to unknown"
+  (begin
+    (assert (eq? :additive (ddl:one-verdict "CREATE DATABASE `uamdb`;"))
+            "create database is additive -- it is shinka's own first op arm")
+    (assert (eq? :additive (ddl:one-verdict "USE `authdb`;")) "use")
+    (assert (eq? :additive (ddl:one-verdict "UNLOCK TABLES;")) "unlock tables")
+    (assert (eq? :blocking (ddl:one-verdict "LOCK TABLES t WRITE;"))
+            "lock tables is blocking, not benign")
+    (assert (eq? :blocking (ddl:one-verdict "ALTER TABLE items_folders ADD INDEX idx_account_parent (a, b);"))
+            "mysql add index is blocking, not unknown")
+    (assert (eq? :blocking (ddl:one-verdict "ALTER TABLE uid_expirations ADD UNIQUE KEY uk_uid (uid);"))
+            "add unique key is blocking")
+    (assert (eq? :schema-destructive
+                 (ddl:one-verdict "ALTER TABLE t DROP INDEX idx_gone;"))
+            "dropping an index is still a cut")
+    (assert (eq? :additive
+                 (ddl:one-verdict "ALTER TABLE `accesses` ALTER is_approved SET DEFAULT '';"))
+            "set default is additive")
+    (assert (eq? :schema-destructive
+                 (ddl:one-verdict "ALTER TABLE t ALTER c DROP DEFAULT;"))
+            "drop default is its destructive counterpart")))
+
+;; Point DDL_CORPUS at a directory of .sql and every statement in it must
+;; classify -- no `unknown`. Skipped when unset, so the library's own suite
+;; stays self-contained and portable. Used against camelot's 9-file, 2898-line
+;; application model: 0 unknowns, 94 drops refused.
+(deftest "an external corpus classifies with zero unknowns"
+  (let ((corpus (env-get "DDL_CORPUS" "")))
+    (if (and (not (eq? corpus "")) (is-dir? corpus))
+        (map (fn (p)
+               (map (fn (v)
+                      (assert (not (eq? (ddl:verdict-of v) :unknown))
+                              (string-append "unclassified statement in " p)))
+                    (ddl:classify-document (read-file p))))
+             (filter (fn (p) (string-ends-with? p ".sql")) (ls corpus)))
+        #t)))
+
+(deftest "the mysqldump drop form is refused"
+  (assert (eq? :schema-destructive (ddl:one-verdict "DROP TABLE IF EXISTS `users`;"))
+          "drop table if exists is still a drop"))
+
+(deftest "the sunset lifecycle has five steps and no sixth"
+  (begin
+    (assert (eq? 5 (length ddl:sunset-steps)) "five steps")
+    (assert (ddl:sunset-step? "seal") "seal is the last step")
+    (assert (not (ddl:sunset-step? "drop")) "there is no drop step")
+    (assert (eq? :additive
+                     (ddl:one-verdict (ddl:sunset-comment "t" "c" "c_v2" "2026-08-05")))
+                "a sunset tag is itself additive")))
