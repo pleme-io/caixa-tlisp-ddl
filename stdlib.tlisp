@@ -483,8 +483,8 @@
 
 ;; Point DDL_CORPUS at a directory of .sql and every statement in it must
 ;; classify -- no `unknown`. Skipped when unset, so the library's own suite
-;; stays self-contained and portable. Used against camelot's 9-file, 2898-line
-;; application model: 0 unknowns, 94 drops refused.
+;; stays self-contained and portable. Measured against a 9-file, 2898-line
+;; production application model: 0 unknowns, 94 drops refused.
 (deftest "an external corpus classifies with zero unknowns"
   (let ((corpus (env-get "DDL_CORPUS" "")))
     (if (and (not (eq? corpus "")) (is-dir? corpus))
