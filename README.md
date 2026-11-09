@@ -6,7 +6,7 @@ shinka model delivery. Depends on caixa-tlisp-core for the result accessors.
 Ninth member of the `caixa-tlisp-*` family (`stdlib`, `core`, `git`, `cargo`,
 `helm`, `handoff`, `gha`, `rollout`).
 
-The contract, from `theory/SHINKA-MODEL-EVOLUTION.md` §IV.5: a model grows and
+The contract: a model grows and
 is never cut. Columns are tagged and sunset, drained and sealed. They are not
 dropped.
 

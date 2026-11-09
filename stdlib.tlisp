@@ -4,7 +4,7 @@
 ;; own entry point (tatara-script `require` does not import at top level;
 ;; composition is by inlining, per the family's convention — see README).
 ;;
-;; The contract this enforces, from theory/SHINKA-MODEL-EVOLUTION.md §IV.5:
+;; The contract this enforces:
 ;; a model grows and is never cut. Columns are tagged and sunset, drained and
 ;; sealed — they are not dropped. The classifier is FAIL-CLOSED: anything it
 ;; cannot positively recognise as additive is refused, so a novel statement
